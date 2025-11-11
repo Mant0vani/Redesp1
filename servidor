@@ -1,34 +1,374 @@
 #!/usr/bin/env python3
+import sys
 import asyncio
+
+
+if sys.platform.startswith('win') and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 from tcp import Servidor
 import re
 
 
-def validar_nome(nome):
+
+# ===== Estruturas globais =====
+
+# Todas as conexões ativas
+clientes = set()
+
+# Mapa de apelidos: nick_lower -> conexao
+nicks = {}
+
+# Mapa de canais: canal_lower -> set(conexao)
+channels = {}
+
+# Nome canônico do canal (primeira forma usada): canal_lower -> nome_original
+channel_names = {}
+
+
+# ===== Utilitários =====
+
+def validar_nome(nome: bytes) -> bool:
+    # Primeira letra: [A-Za-z], restante: [A-Za-z0-9_-]
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 
+def remover_nick(conexao):
+    nick = getattr(conexao, "nick", b'*')
+    if nick and nick not in (b'*',):
+        lower = nick.lower()
+        dono = nicks.get(lower)
+        if dono is conexao:
+            del nicks[lower]
+
+
+def remover_conexao_dos_canais(conexao):
+    canais = getattr(conexao, "canais", set())
+    for ch_lower in list(canais):
+        membros = channels.get(ch_lower)
+        if not membros:
+            continue
+        if conexao in membros:
+            membros.remove(conexao)
+        if not membros:
+            # canal esvaziou
+            channels.pop(ch_lower, None)
+            channel_names.pop(ch_lower, None)
+        canais.discard(ch_lower)
+
+
+def broadcast_quit(conexao):
+    """
+    Envia QUIT para todos os usuários que compartilham
+    pelo menos um canal com essa conexão.
+    """
+    nick = getattr(conexao, "nick", b'*')
+    if not nick or nick == b'*':
+        return
+
+    msg = b':%s QUIT :Connection closed\r\n' % nick
+    enviados = set()
+
+    for ch_lower in getattr(conexao, "canais", set()):
+        for outro in channels.get(ch_lower, set()):
+            if outro is not conexao and outro not in enviados:
+                    try:
+                        outro.enviar(msg)
+                    except (OSError, ConnectionAbortedError, ConnectionResetError):
+                        # cliente já fechou a conexão
+                        pass
+                    enviados.add(outro)
+
+
 def sair(conexao):
+    # Avisar QUIT para quem divide canal
+    broadcast_quit(conexao)
+
+    # Limpar estruturas globais
+    remover_nick(conexao)
+    remover_conexao_dos_canais(conexao)
+    clientes.discard(conexao)
+
     print(conexao, 'conexão fechada')
     conexao.fechar()
 
 
-def dados_recebidos(conexao, dados):
-    if dados == b'':
-        return sair(conexao)
-    print(conexao, dados)
+def parse_line(line: bytes):
+    """
+    Parser simples no estilo IRC:
+    [':' prefixo ' '] CMD [arg1 ...] [':' último parâmetro]
+    Retorna (cmd, args)
+    """
+    # Ignora prefixo se vier (clientes dos testes não mandam, mas deixamos robusto)
+    if line.startswith(b':'):
+        try:
+            _, line = line.split(b' ', 1)
+        except ValueError:
+            return None, []
 
+    if b' :' in line:
+        before, trailing = line.split(b' :', 1)
+        parts = before.split()
+        parts.append(trailing)
+    else:
+        parts = line.split()
+
+    if not parts:
+        return None, []
+
+    cmd = parts[0].upper()
+    args = parts[1:]
+    return cmd, args
+
+
+# ===== Handlers de comandos =====
+
+def handle_ping(conexao, args):
+    payload = args[0] if args else b''
+    resposta = b':server PONG server :%s\r\n' % payload
+    conexao.enviar(resposta)
+
+
+def handle_nick(conexao, args):
+    if not args:
+        return
+
+    novo = args[0]
+    atual = getattr(conexao, "nick", b'*')
+    registrado = getattr(conexao, "registrado", False)
+
+    # Validação de sintaxe
+    if not validar_nome(novo):
+        apelido_atual = atual if (registrado and atual not in (b'*',)) else b'*'
+        msg = b':server 432 %s %s :Erroneous nickname\r\n' % (apelido_atual, novo)
+        conexao.enviar(msg)
+        return
+
+    lower = novo.lower()
+    dono = nicks.get(lower)
+
+    # Já está em uso por outro
+    if dono is not None and dono is not conexao:
+        apelido_atual = atual if (registrado and atual not in (b'*',)) else b'*'
+        msg = b':server 433 %s %s :Nickname is already in use\r\n' % (apelido_atual, novo)
+        conexao.enviar(msg)
+        return
+
+    # Primeiro apelido válido (registro)
+    if not registrado or atual == b'*':
+        conexao.nick = novo
+        conexao.registrado = True
+        nicks[lower] = conexao
+
+        conexao.enviar(b':server 001 %s :Welcome\r\n' % novo)
+        conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % novo)
+        return
+
+    # Troca de apelido (já registrado antes)
+    old = atual
+    old_lower = old.lower()
+    if nicks.get(old_lower) is conexao:
+        del nicks[old_lower]
+
+    conexao.nick = novo
+    nicks[lower] = conexao
+
+    msg = b':%s NICK %s\r\n' % (old, novo)
+
+    # Envia para o próprio
+    conexao.enviar(msg)
+
+    # Envia para quem compartilha canal
+    enviados = set()
+    for ch_lower in getattr(conexao, "canais", set()):
+        for outro in channels.get(ch_lower, set()):
+            if outro is not conexao and outro not in enviados:
+                outro.enviar(msg)
+                enviados.add(outro)
+
+
+def handle_join(conexao, args):
+    if not getattr(conexao, "registrado", False):
+        return
+    if not args:
+        return
+
+    canal = args[0]
+    if not canal.startswith(b'#'):
+        # Nome inválido de canal
+        conexao.enviar(b':server 403 %s :No such channel\r\n' % canal)
+        return
+
+    ch_lower = canal.lower()
+
+    if ch_lower not in channels:
+        channels[ch_lower] = set()
+        channel_names[ch_lower] = canal
+
+    if not hasattr(conexao, "canais"):
+        conexao.canais = set()
+
+    # Nome canônico (primeiro utilizado)
+    canal_canon = channel_names[ch_lower]
+
+    # Adiciona ao canal se ainda não estiver
+    if conexao not in channels[ch_lower]:
+        channels[ch_lower].add(conexao)
+        conexao.canais.add(ch_lower)
+
+    # Mensagem JOIN para todos do canal (incluindo quem entrou)
+    join_msg = b':%s JOIN :%s\r\n' % (conexao.nick, canal_canon)
+    for c in list(channels[ch_lower]):
+        c.enviar(join_msg)
+
+    # Envia NAMES (353 + 366) apenas para o usuário que entrou
+    membros = sorted(
+        c.nick
+        for c in channels[ch_lower]
+        if getattr(c, "nick", b'*') not in (b'*',)
+    )
+
+    names_line = b':server 353 %s = %s :%s\r\n' % (
+        conexao.nick,
+        canal_canon,
+        b' '.join(membros),
+    )
+    end_line = b':server 366 %s %s :End of /NAMES list.\r\n' % (
+        conexao.nick,
+        canal_canon,
+    )
+
+    conexao.enviar(names_line)
+    conexao.enviar(end_line)
+
+
+def handle_part(conexao, args):
+    if not getattr(conexao, "registrado", False):
+        return
+    if not args:
+        return
+
+    canal = args[0]
+    ch_lower = canal.lower()
+    if ch_lower not in channels:
+        return
+    if conexao not in channels[ch_lower]:
+        return
+
+    canal_canon = channel_names.get(ch_lower, canal)
+
+    # Remove do canal antes de decidir quem recebe
+    channels[ch_lower].remove(conexao)
+    if hasattr(conexao, "canais"):
+        conexao.canais.discard(ch_lower)
+
+    # Mensagem PART para todos que estavam no canal, incluindo quem saiu
+    msg = b':%s PART %s\r\n' % (conexao.nick, canal_canon)
+    # conjunto de quem ainda está + o próprio
+    destinatarios = set(channels.get(ch_lower, set()))
+    destinatarios.add(conexao)
+    for c in destinatarios:
+        if c in clientes:
+            c.enviar(msg)
+
+    # Remove canal vazio
+    if not channels.get(ch_lower):
+        channels.pop(ch_lower, None)
+        channel_names.pop(ch_lower, None)
+
+
+def handle_privmsg(conexao, args):
+    if not getattr(conexao, "registrado", False):
+        return
+    if len(args) < 2:
+        return
+
+    alvo = args[0]
+    texto = args[1]
+
+    # Canal
+    if alvo.startswith(b'#'):
+        ch_lower = alvo.lower()
+        if ch_lower not in channels:
+            return
+        canal_canon = channel_names.get(ch_lower, alvo)
+        msg = b':%s PRIVMSG %s :%s\r\n' % (conexao.nick, canal_canon, texto)
+        for c in channels[ch_lower]:
+            if c is not conexao:
+                c.enviar(msg)
+        return
+
+    # Privado (nick)
+    dest = nicks.get(alvo.lower())
+    if not dest:
+        return
+    target = getattr(dest, "nick", alvo)
+    msg = b':%s PRIVMSG %s :%s\r\n' % (conexao.nick, target, texto)
+    dest.enviar(msg)
+
+
+def handle_quit_cmd(conexao):
+    sair(conexao)
+
+
+# ===== Loop de recepção =====
+
+def dados_recebidos(conexao, dados):
+    # Cliente fechou conexão
+    if not dados:
+        sair(conexao)
+        return
+
+    # Buffer para tratar fragmentação e múltiplas linhas
+    if not hasattr(conexao, "buffer"):
+        conexao.buffer = b''
+
+    conexao.buffer += dados
+
+    # Processa todas as linhas completas disponíveis
+    while b'\n' in conexao.buffer:
+        linha, resto = conexao.buffer.split(b'\n', 1)
+        conexao.buffer = resto
+
+        if linha.endswith(b'\r'):
+            linha = linha[:-1]
+        linha = linha.strip()
+        if not linha:
+            continue
+
+        cmd, args = parse_line(linha)
+        if cmd is None:
+            continue
+
+        if cmd == b'PING':
+            handle_ping(conexao, args)
+        elif cmd == b'NICK':
+            handle_nick(conexao, args)
+        elif cmd == b'JOIN':
+            handle_join(conexao, args)
+        elif cmd == b'PART':
+            handle_part(conexao, args)
+        elif cmd == b'PRIVMSG':
+            handle_privmsg(conexao, args)
+        elif cmd == b'QUIT':
+            handle_quit_cmd(conexao)
+            # QUIT encerra a conexão; não processa mais nada
+            return
+        # comandos desconhecidos são ignorados
+
+
+# ===== Aceitação de conexões =====
 
 def conexao_aceita(conexao):
     print(conexao, 'nova conexão')
+    clientes.add(conexao)
 
-    # Note que, no Python, atributos NÃO precisam ser previamente declarados na classe!
-    # Se precisar, esta função é o melhor local para adicionar novos atributos ao objeto conexao.
-    #
-    # Por exemplo, para armazenar o nick do usuário:
+    # Estado inicial da conexão
     conexao.nick = b'*'
-
-    # Fique à vontade para adicionar mais atributos, se necessário.
+    conexao.registrado = False
+    conexao.buffer = b''
+    conexao.canais = set()
 
     conexao.registrar_recebedor(dados_recebidos)
 

@@ -22,7 +22,11 @@ class Conexao:
         asyncio.get_event_loop().add_reader(self.s, lambda: callback(self, self.s.recv(8192)))
 
     def enviar(self, dados):
-        self.s.sendall(dados)
+        try:
+            self.s.sendall(dados)
+        except (OSError, ConnectionAbortedError, ConnectionResetError):
+        # Conexão já encerrada pelo cliente
+            pass
 
     def fechar(self):
         asyncio.get_event_loop().remove_reader(self.s)
